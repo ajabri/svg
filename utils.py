@@ -24,6 +24,24 @@ import imageio
 
 hostname = socket.gethostname()
 
+import sys
+
+def info(type, value, tb):
+    if hasattr(sys, 'ps1') or not sys.stderr.isatty():
+    # we are in interactive mode or we don't have a tty-like
+    # device, so we call the default hook
+        sys.__excepthook__(type, value, tb)
+    else:
+        import traceback, pdb
+        # we are NOT in interactive mode, print the exception...
+        traceback.print_exception(type, value, tb)
+        print
+        # ...then start the debugger in post-mortem mode.
+        # pdb.pm() # deprecated
+        pdb.post_mortem(tb) # more "modern"
+
+sys.excepthook = info
+
 def load_dataset(opt):
     if opt.dataset == 'smmnist':
         from data.moving_mnist import MovingMNIST
@@ -65,14 +83,26 @@ def load_dataset(opt):
                 data_root=opt.data_root,
                 seq_len=opt.n_eval, 
                 image_size=opt.image_width)
-    
+    elif opt.dataset == 'nfs':
+        from data.speed import NeedForSpeed
+        train_data = NeedForSpeed(
+                data_root=opt.data_root,
+                train=True,
+                seq_len=opt.n_past+opt.n_future,
+                image_size=opt.image_width)
+        test_data = NeedForSpeed(
+                data_root=opt.data_root,
+                train=False,
+                seq_len=opt.n_eval,
+                image_size=opt.image_width)
+
     return train_data, test_data
 
 def sequence_input(seq, dtype):
     return [Variable(x.type(dtype)) for x in seq]
 
 def normalize_data(opt, dtype, sequence):
-    if opt.dataset == 'smmnist' or opt.dataset == 'kth' or opt.dataset == 'bair' :
+    if opt.dataset == 'smmnist' or opt.dataset == 'kth' or opt.dataset == 'bair' or opt.dataset == 'nfs' :
         sequence.transpose_(0, 1)
         sequence.transpose_(3, 4).transpose_(2, 3)
     else:
@@ -135,12 +165,28 @@ def image_tensor(inputs, padding=1):
                    (i+1) * y_dim + i * padding].copy_(image)
         return result
 
+def to_uint8(x):
+    x /= x.max()
+    x *= 255
+    x = x.astype(np.uint8)
+    return x
+
+def numpy_to_PIL(x):
+    x = x.transpose(1, 2, 0)
+    x = to_uint8(x)
+    return Image.fromarray(x)
+
+    
 def save_np_img(fname, x):
     if x.shape[0] == 1:
         x = np.tile(x, (3, 1, 1))
-    img = scipy.misc.toimage(x,
-                             high=255*x.max(),
-                             channel_axis=0)
+    # img = Image.fromarray(x)
+    img = numpy_to_PIL(x)
+    # img = scipy.misc.toimage(x,
+    #                          high=255*x.max(),
+    #                          channel_axis=0)
+    # import pdb; pdb.set_trace()
+
     img.save(fname)
 
 def make_image(tensor):
@@ -148,9 +194,12 @@ def make_image(tensor):
     if tensor.size(0) == 1:
         tensor = tensor.expand(3, tensor.size(1), tensor.size(2))
     # pdb.set_trace()
-    return scipy.misc.toimage(tensor.numpy(),
-                              high=255*tensor.max(),
-                              channel_axis=0)
+    img = numpy_to_PIL(tensor.numpy())
+    # scipy.misc.toimage(tensor.numpy(),
+    #                           high=255*tensor.max(),
+    #                           channel_axis=0)
+    # import pdb; pdb.set_trace()
+    return img
 
 def draw_text_tensor(tensor, text):
     np_x = tensor.transpose(0, 1).transpose(1, 2).data.cpu().numpy()
@@ -166,7 +215,9 @@ def save_gif(filename, inputs, duration=0.25):
         img = image_tensor(tensor, padding=0)
         img = img.cpu()
         img = img.transpose(0,1).transpose(1,2).clamp(0,1)
-        images.append(img.numpy())
+        images.append(to_uint8(img.numpy()))
+        # import pdb; pdb.set_trace()
+
     imageio.mimsave(filename, images, duration=duration)
 
 def save_gif_with_text(filename, inputs, text, duration=0.25):
@@ -175,7 +226,7 @@ def save_gif_with_text(filename, inputs, text, duration=0.25):
         img = image_tensor([draw_text_tensor(ti, texti) for ti, texti in zip(tensor, text)], padding=0)
         img = img.cpu()
         img = img.transpose(0,1).transpose(1,2).clamp(0,1).numpy()
-        images.append(img)
+        images.append(to_uint8(img))
     imageio.mimsave(filename, images, duration=duration)
 
 def save_image(filename, tensor):

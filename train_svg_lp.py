@@ -15,6 +15,7 @@ parser = argparse.ArgumentParser()
 parser.add_argument('--lr', default=0.002, type=float, help='learning rate')
 parser.add_argument('--beta1', default=0.9, type=float, help='momentum term for adam')
 parser.add_argument('--batch_size', default=100, type=int, help='batch size')
+parser.add_argument('--test_batch_size', default=100, type=int, help='batch size')
 parser.add_argument('--log_dir', default='logs/lp', help='base directory to save logs')
 parser.add_argument('--model_dir', default='', help='base directory to save logs')
 parser.add_argument('--name', default='', help='identifier for directory')
@@ -40,7 +41,8 @@ parser.add_argument('--model', default='dcgan', help='model type (dcgan | vgg)')
 parser.add_argument('--data_threads', type=int, default=5, help='number of data loading threads')
 parser.add_argument('--num_digits', type=int, default=2, help='number of digits for moving mnist')
 parser.add_argument('--last_frame_skip', action='store_true', help='if true, skip connections go between frame t and frame t+t rather than last ground truth frame')
-
+parser.add_argument('--modulator', action='store_true', default=False, help='')
+parser.add_argument('--deterministic', action='store_true', default=False, help='')
 
 
 opt = parser.parse_args()
@@ -53,6 +55,8 @@ if opt.model_dir != '':
     opt.optimizer = optimizer
     opt.model_dir = model_dir
     opt.log_dir = '%s/continued' % opt.log_dir
+    if not hasattr(opt, 'test_batch_size'):
+        opt.test_batch_size = opt.batch_size
 else:
     name = 'model=%s%dx%d-rnn_size=%d-predictor-posterior-prior-rnn_layers=%d-%d-%d-n_past=%d-n_future=%d-lr=%.4f-g_dim=%d-z_dim=%d-last_frame_skip=%s-beta=%.7f%s' % (opt.model, opt.image_width, opt.image_width, opt.rnn_size, opt.predictor_rnn_layers, opt.posterior_rnn_layers, opt.prior_rnn_layers, opt.n_past, opt.n_future, opt.lr, opt.g_dim, opt.z_dim, opt.last_frame_skip, opt.beta, opt.name)
     if opt.dataset == 'smmnist':
@@ -86,6 +90,7 @@ else:
 
 
 import models.lstm as lstm_models
+lstm_models.LSTM_CELL_TYPE = 'cudnn' if not opt.modulator else 'custom'
 if opt.model_dir != '':
     frame_predictor = saved_model['frame_predictor']
     posterior = saved_model['posterior']
@@ -112,13 +117,16 @@ else:
     raise ValueError('Unknown model: %s' % opt.model)
        
 if opt.model_dir != '':
-    decoder = saved_model['decoder']
-    encoder = saved_model['encoder']
+    decoder = saved_model['decoder'].module
+    encoder = saved_model['encoder'].module
 else:
     encoder = model.encoder(opt.g_dim, opt.channels)
     decoder = model.decoder(opt.g_dim, opt.channels)
     encoder.apply(utils.init_weights)
     decoder.apply(utils.init_weights)
+
+# encoder = nn.DataParallel(encoder)
+# decoder = nn.DataParallel(decoder)
 
 frame_predictor_optimizer = opt.optimizer(frame_predictor.parameters(), lr=opt.lr, betas=(opt.beta1, 0.999))
 posterior_optimizer = opt.optimizer(posterior.parameters(), lr=opt.lr, betas=(opt.beta1, 0.999))
@@ -136,6 +144,21 @@ def kl_criterion(mu1, logvar1, mu2, logvar2):
     sigma2 = logvar2.mul(0.5).exp() 
     kld = torch.log(sigma2/sigma1) + (torch.exp(logvar1) + (mu1 - mu2)**2)/(2*torch.exp(logvar2)) - 1/2
     return kld.sum() / opt.batch_size
+
+# --------- context parameters --------------------------------
+import models.modulate as modulate
+latent_dim = opt.g_dim
+context_params = torch.zeros(size=[1, latent_dim], requires_grad=True)
+context_encoder = nn.Sequential(*[
+    nn.Linear(latent_dim, latent_dim),
+    nn.LeakyReLU(0.1),
+    nn.Linear(latent_dim, 2*latent_dim)
+])
+
+context_params = context_params.cuda()
+context_encoder.cuda()
+
+modulator = modulate.CondBN(encoder=context_encoder, context=context_params, module=None)
 
 # --------- transfer to gpu ------------------------------------
 frame_predictor.cuda()
@@ -156,7 +179,7 @@ train_loader = DataLoader(train_data,
                           pin_memory=True)
 test_loader = DataLoader(test_data,
                          num_workers=opt.data_threads,
-                         batch_size=opt.batch_size,
+                         batch_size=opt.test_batch_size,
                          shuffle=True,
                          drop_last=True,
                          pin_memory=True)
@@ -177,16 +200,21 @@ testing_batch_generator = get_testing_batch()
 
 # --------- plotting funtions ------------------------------------
 def plot(x, epoch):
-    nsample = 20 
+    nsample = min(opt.test_batch_size, 20)
     gen_seq = [[] for i in range(nsample)]
     gt_seq = [x[i] for i in range(len(x))]
 
+    # import pdb; pdb.set_trace()
+    if opt.modulator:
+        modulator.reset_context(x[0].shape[0])
+
     for s in range(nsample):
-        frame_predictor.hidden = frame_predictor.init_hidden()
-        posterior.hidden = posterior.init_hidden()
-        prior.hidden = prior.init_hidden()
+        frame_predictor.hidden = frame_predictor.init_hidden(opt.test_batch_size)
+        posterior.hidden = posterior.init_hidden(opt.test_batch_size)
+        prior.hidden = prior.init_hidden(opt.test_batch_size)
         gen_seq[s].append(x[0])
         x_in = x[0]
+
         for i in range(1, opt.n_eval):
             h = encoder(x_in)
             if opt.last_frame_skip or i < opt.n_past:	
@@ -194,19 +222,42 @@ def plot(x, epoch):
             else:
                 h, _ = h
             h = h.detach()
+
+            if opt.modulator:
+                h = modulator(h, modulator.context)
+
             if i < opt.n_past:
                 h_target = encoder(x[i])
-                h_target = h_target[0].detach()
-                z_t, _, _ = posterior(h_target)
-                prior(h)
-                frame_predictor(torch.cat([h, z_t], 1))
+                h_target = h_target[0] #.detach()
+
+                if opt.modulator:
+                    h_target = modulator(h_target, modulator.context)
+
+                if not opt.deterministic:
+                    z_t, _, _ = posterior(h_target)
+                    prior(h)
+
+                h_pred = frame_predictor(torch.cat([h, z_t], 1))
+                x_pred = decoder([h_pred, skip])
+
+                mse = mse_criterion(x_pred, x[i])
+                # print('sample', s, 'step', i, mse.item())
+
+                if opt.modulator:
+                    modulator.update_context(mse)
+
+                # store ground truth frames for visualization
                 x_in = x[i]
                 gen_seq[s].append(x_in)
+
             else:
                 z_t, _, _ = prior(h)
                 h = frame_predictor(torch.cat([h, z_t], 1)).detach()
                 x_in = decoder([h, skip]).detach()
                 gen_seq[s].append(x_in)
+
+            # gen_seq
+            
 
     to_plot = []
     gifs = [ [] for t in range(opt.n_eval) ]
@@ -255,8 +306,9 @@ def plot(x, epoch):
 
 
 def plot_rec(x, epoch):
-    frame_predictor.hidden = frame_predictor.init_hidden()
-    posterior.hidden = posterior.init_hidden()
+    frame_predictor.hidden = frame_predictor.init_hidden(opt.test_batch_size)
+    prior.hidden = prior.init_hidden(opt.test_batch_size)
+    posterior.hidden = posterior.init_hidden(opt.test_batch_size)
     gen_seq = []
     gen_seq.append(x[0])
     x_in = x[0]
@@ -303,22 +355,44 @@ def train(x):
     posterior.hidden = posterior.init_hidden()
     prior.hidden = prior.init_hidden()
 
+    if opt.modulator:
+        modulator.reset_context(x[0].shape[0])
+
     mse = 0
     kld = 0
+    
     for i in range(1, opt.n_past+opt.n_future):
+        # import pdb; pdb.set_trace()
+
         h = encoder(x[i-1])
         h_target = encoder(x[i])[0]
+        
         if opt.last_frame_skip or i < opt.n_past:	
             h, skip = h
         else:
             h = h[0]
+        
+        if opt.modulator:
+            # import pdb; pdb.set_trace()
+            h = modulator(h, modulator.context)
+            h_target = modulator(h_target, modulator.context)
+        
         z_t, mu, logvar = posterior(h_target)
         _, mu_p, logvar_p = prior(h)
         h_pred = frame_predictor(torch.cat([h, z_t], 1))
+
         x_pred = decoder([h_pred, skip])
-        mse += mse_criterion(x_pred, x[i])
+        _mse = mse_criterion(x_pred, x[i])
+
+        mse += _mse
         kld += kl_criterion(mu, logvar, mu_p, logvar_p)
 
+        if i < opt.n_past and opt.modulator:
+            ## adaptation here
+            modulator.update_context(mse)
+            # print('step', i, mse.item())
+
+        
     loss = mse + kld*opt.beta
     loss.backward()
 
@@ -376,6 +450,7 @@ for epoch in range(opt.niter):
         'prior': prior,
         'opt': opt},
         '%s/model.pth' % opt.log_dir)
+
     if epoch % 10 == 0:
         print('log dir: %s' % opt.log_dir)
         

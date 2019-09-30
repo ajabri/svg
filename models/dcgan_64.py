@@ -51,6 +51,7 @@ class encoder(nn.Module):
         h3 = self.c3(h2)
         h4 = self.c4(h3)
         h5 = self.c5(h4)
+
         return h5.view(-1, self.dim), [h1, h2, h3, h4]
 
 
